@@ -1,0 +1,13 @@
+# 凭据与本地状态 —— 绝不提交
+config/
+*.local.json
+
+# Node
+node_modules/
+
+# 系统
+.DS_Store
+
+# 日志与临时文件
+*.log
+*.tmp

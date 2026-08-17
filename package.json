@@ -1,0 +1,14 @@
+{
+  "name": "cline-gateway",
+  "version": "0.1.0",
+  "description": "Local OpenAI-compatible gateway bridging Cline free models (api.cline.bot OAuth tokens). Zero deps, single file.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
