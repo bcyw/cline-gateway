@@ -31,10 +31,19 @@ const server = createServer(async (req, res) => {
     for await (const c of req) chunks.push(c);
     const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
     console.log(`[mock] refresh grantType=${body.grantType} refresh=${(body.refreshToken ?? "").slice(0, 24)}...`);
+    // 场景控制：refresh token 包含特定标记模拟不同失败
+    if ((body.refreshToken ?? "").includes("transient-fail")) {
+      return json(500, { error: "upstream temporary error" });
+    }
+    if ((body.refreshToken ?? "").includes("invalid-grant")) {
+      return json(400, { error: "invalid_grant: refresh token revoked" });
+    }
+    // 模拟真实 api.cline.bot：accessToken 是裸 JWT（无 workos: 前缀），
+    // refreshToken 轮换为新值 —— 网关必须规范化前缀后才能继续使用
     return json(200, {
       success: true,
       data: {
-        accessToken: "workos:refreshed-access",
+        accessToken: "refreshed-access-jwt",
         refreshToken: "workos:refreshed-refresh",
         tokenType: "Bearer",
         expiresAt: new Date(Date.now() + 3600_000).toISOString(),

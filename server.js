@@ -41,7 +41,7 @@
  *   Model:    deepseek/deepseek-v4-flash
  */
 import { createServer } from "node:http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -124,6 +124,7 @@ function loadTokens() {
 }
 
 // 回写 token 文件（401 refresh 成功后持久化），0600 权限，按 email 去重
+// 原子写：先写临时文件再 rename，避免进程崩溃/多实例并发读到半写文件
 function saveTokens() {
   const own = state.tokens.filter((t) => t.refresh);
   if (!own.length) return;
@@ -135,8 +136,10 @@ function saveTokens() {
   }
   try {
     mkdirSync(dirname(TOKENS_FILE), { recursive: true });
-    writeFileSync(TOKENS_FILE, JSON.stringify(dedup, null, 2) + "\n");
-    chmodSync(TOKENS_FILE, 0o600);
+    const tmp = `${TOKENS_FILE}.tmp`;
+    writeFileSync(tmp, JSON.stringify(dedup, null, 2) + "\n");
+    chmodSync(tmp, 0o600);
+    renameSync(tmp, TOKENS_FILE);
   } catch (e) {
     console.error(`[cline-gateway] 写 ${TOKENS_FILE} 失败: ${e.message}`);
   }
@@ -290,12 +293,59 @@ function needsRefresh(cred) {
 
 // per-account refresh 锁：并发请求共享同一 refresh promise，
 // 避免多个请求同时刷新导致 refresh token 轮换竞争
-const refreshLocks = new Map(); // key: refresh token -> Promise<boolean>
+const refreshLocks = new Map(); // key: refresh token -> Promise<"ok"|"transient"|"invalid_grant">
 
+// 对齐 Cline 源码 getValidClineCredentials 的错误语义（cline.ts:821-871）：
+//   - invalid_grant（400/401/403 + invalid/expired/revoked/unauthorized）
+//     → refresh token 被拒绝，必须重新登录
+//   - 其余（网络、超时、5xx、响应异常）→ 瞬时失败，调用方应保留当前 token 继续用
+function isInvalidGrant(r, j) {
+  const code = String(j?.errorCode ?? j?.error?.code ?? "");
+  if (/invalid_grant|invalid_token|unauthorized/i.test(code)) return true;
+  if (r.status === 400 || r.status === 401 || r.status === 403) {
+    const text = JSON.stringify(j) || "";
+    return /invalid|expired|revoked|unauthorized/i.test(text);
+  }
+  return false;
+}
+
+// 多实例防护：重读 tokens.json，若同账号已被另一实例刷新过（access 已更新），
+// 直接采用文件里的最新凭证，不再调用 refresh 接口（避免旧 refresh token 竞争）
+function adoptNewerFromFile(cred) {
+  try {
+    const arr = JSON.parse(readFileSync(TOKENS_FILE, "utf8"));
+    if (!Array.isArray(arr)) return false;
+    const match =
+      (cred.email ? arr.find((t) => t.email === cred.email) : undefined) ??
+      arr.find((t) => t.refresh && t.refresh === cred.refresh);
+    if (!match) return false;
+    let adopted = false;
+    // 注意：文件里 access 是裸 JWT，必须 normalize 后再比较（否则永远不等，误判"已刷新"）
+    if (match.access && normalizeToken(match.access) !== cred.access) {
+      cred.access = normalizeToken(match.access);
+      if (match.refresh) cred.refresh = match.refresh;
+      if (typeof match.expires === "number") cred.expires = match.expires;
+      console.warn(`[cline-gateway] ${cred.email ?? "?"} 采用文件中的最新凭证（另一实例已刷新）`);
+      adopted = true;
+    } else if (match.refresh && match.refresh !== cred.refresh) {
+      cred.refresh = match.refresh; // refresh 已轮换，用文件里的最新值
+    }
+    return adopted;
+  } catch {
+    return false;
+  }
+}
+
+// 返回值三态：
+//   "ok"           — 刷新成功，cred 已更新为最新凭证（access 已带 workos: 前缀）
+//   "transient"    — 瞬时失败（网络/5xx），凭据未变；调用方应沿用当前 access 继续
+//   "invalid_grant" — refresh token 被拒绝，需重新登录（node oauth.js）
 async function tryRefresh(cred) {
-  if (!cred.refresh) return false;
+  if (!cred.refresh) return "invalid_grant";
   if (refreshLocks.has(cred.refresh)) return refreshLocks.get(cred.refresh);
   const p = (async () => {
+    // 多实例防护：文件里已有更新凭证就直接采用
+    if (adoptNewerFromFile(cred)) return "ok";
     try {
       const r = await fetch(`${CLINE_API_BASE}/auth/refresh`, {
         method: "POST",
@@ -305,18 +355,28 @@ async function tryRefresh(cred) {
       });
       const j = await r.json().catch(() => ({}));
       if (!r.ok || !j.success || !j.data?.accessToken) {
-        console.warn("[cline-gateway] refresh 失败，该账号需重新登录 (node oauth.js)");
-        return false;
+        if (isInvalidGrant(r, j)) {
+          console.warn(`[cline-gateway] ${cred.email ?? "?"} refresh token 被拒绝 (invalid_grant)，需重新登录 (node oauth.js)`);
+          return "invalid_grant";
+        }
+        console.warn(`[cline-gateway] ${cred.email ?? "?"} refresh 瞬时失败 (HTTP ${r.status})，沿用当前 token`);
+        return "transient";
       }
-      cred.access = j.data.accessToken;
+      // 根因修复：refresh 返回的 accessToken 是裸 JWT（实测无 workos: 前缀），
+      // 必须规范化后再发送，否则上游 401 断连
+      cred.access = normalizeToken(j.data.accessToken);
       if (j.data.refreshToken) cred.refresh = j.data.refreshToken;
-      if (j.data.expiresAt) cred.expires = Date.parse(j.data.expiresAt);
+      // expiresAt 解析失败时保留旧值（避免写入 NaN 导致永不预刷新）
+      if (j.data.expiresAt) {
+        const e = Date.parse(j.data.expiresAt);
+        if (!Number.isNaN(e)) cred.expires = e;
+      }
       console.warn(`[cline-gateway] token 刷新成功 (${cred.email ?? "unknown"})`);
       saveTokens();
-      return true;
+      return "ok";
     } catch (e) {
-      console.warn(`[cline-gateway] refresh 异常: ${e.message}`);
-      return false;
+      console.warn(`[cline-gateway] ${cred.email ?? "?"} refresh 异常: ${e.message}，沿用当前 token`);
+      return "transient";
     }
   })();
   refreshLocks.set(cred.refresh, p);
@@ -363,8 +423,18 @@ async function forwardChat(req, res) {
     // 过期前预刷新（复刻 Cline 的 getValidClineCredentials 行为）
     if (needsRefresh(cred)) {
       console.warn(`[cline-gateway] ${cred.email ?? "?"} token expiring, refreshing before request ...`);
-      if (await tryRefresh(cred)) {
+      const rr = await tryRefresh(cred);
+      if (rr === "ok") {
         // 刷新成功，继续用新 access 发请求
+      } else if (rr === "transient") {
+        // 对齐 Cline 源码：瞬时刷新失败且当前 token 仍有效（>30s grace）时
+        // 保留当前 token 继续用（transient_failure_kept_current），不断连
+        if (typeof cred.expires !== "number" || Date.now() < cred.expires - 30_000) {
+          console.warn(`[cline-gateway] ${cred.email ?? "?"} 沿用当前 token 继续请求`);
+        } else {
+          last = { status: 502, headers: new Headers({ "Content-Type": "application/json" }), body: null, text: async () => JSON.stringify({ error: { message: "token refresh failed (transient) and token expired, try again in a moment", type: "server_error" } }) };
+          continue;
+        }
       } else {
         last = { status: 401, headers: new Headers({ "Content-Type": "application/json" }), body: null, text: async () => JSON.stringify({ error: { message: "token refresh failed, run 'node oauth.js' to re-login", type: "authentication_error" } }) };
         continue;
@@ -385,8 +455,8 @@ async function forwardChat(req, res) {
 
     if (upstream.status === 401 && cred.refresh) {
       console.warn(`[cline-gateway] ${cred.email ?? "?"} -> HTTP 401, attempting refresh ...`);
-      const ok = await tryRefresh(cred);
-      if (ok) {
+      const rr = await tryRefresh(cred);
+      if (rr === "ok") {
         const retried = await callUpstream(cred.access, body).catch((e) => ({ status: 0, error: e }));
         if (retried.error) {
           return sendJson(res, 502, { error: { message: `upstream error: ${retried.error.message}`, type: "server_error" } });
@@ -398,7 +468,12 @@ async function forwardChat(req, res) {
         }
         return passThrough(res, retried, body);
       }
-      last = upstream;
+      // invalid_grant 时明确提示重新登录；瞬时失败（transient）时原样透传 401
+      if (rr === "invalid_grant") {
+        last = { status: 401, headers: upstream.headers, body: null, text: async () => JSON.stringify({ error: { message: "refresh token rejected, run 'node oauth.js' to re-login", type: "authentication_error" } }) };
+      } else {
+        last = upstream;
+      }
       continue;
     }
 

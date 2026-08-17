@@ -151,10 +151,65 @@ console.log("\n[4] refresh：tokens.json 中带 refresh/expires(已过期) 的�
   const text = await r.text();
   assert("refresh 后请求成功", r.status === 200, text.slice(0, 120));
   assert("网关日志含 token 刷新成功", gw2.logs().includes("token 刷新成功"), gw2.logs());
-  // 回写检查：access 已更新
+  // 根因修复验证：mock 返回裸 JWT（refreshed-access-jwt），网关必须加 workos: 前缀再发送
+  assert("刷新后的 access 带 workos: 前缀发送（根因修复）", mock.logs().includes('"authorization":"Bearer workos:refreshed-access-jwt"'), mock.logs().match(/"authorization":"[^"]*"/)?.[0]);
+  // 回写检查：access 已更新（含前缀）
   const saved = JSON.parse(fs.readFileSync(tokenFile, "utf8"));
-  assert("刷新后 access 已回写文件", saved[0].access === "workos:refreshed-access", saved[0]?.access);
+  assert("刷新后 access 已回写文件（带 workos: 前缀）", saved[0].access === "workos:refreshed-access-jwt", saved[0]?.access);
+  assert("刷新后 refresh 已回写文件（轮换新值）", saved[0].refresh === "workos:refreshed-refresh", saved[0]?.refresh);
   stop(gw2.p);
+}
+
+// ---------------------------------------------------------------- 4b. 瞬时刷新失败：沿用当前 token 不断连
+console.log("\n[4b] 瞬时刷新失败（HTTP 500）：token 仍有效时沿用旧 token 继续，不断连");
+{
+  const tokenFile = join(TMP, "tokens3.json");
+  const fs = await import("node:fs");
+  const stillValid = Date.now() + 3 * 60 * 1000; // 3 分钟后过期：<5min 预刷新缓冲（触发刷新），>30s grace（走沿用分支）
+  fs.writeFileSync(tokenFile, JSON.stringify([
+    { access: "workos:still-valid-access", refresh: "transient-fail-refresh", expires: stillValid, email: "t@example.com" },
+  ]));
+  const gw5 = await start(GATEWAY, {
+    PORT: String(9106),
+    CLINE_API_BASE: `http://127.0.0.1:${MOCK_PORT}/api/v1`,
+    CLINE_GATEWAY_TOKENS: tokenFile,
+  });
+  await waitReady("http://127.0.0.1:9106/health");
+  const r = await fetch("http://127.0.0.1:9106/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+  });
+  const text = await r.text();
+  assert("HTTP 200（沿用旧 token 成功）", r.status === 200, text.slice(0, 120));
+  assert("网关日志提示沿用当前 token", gw5.logs().includes("沿用当前 token"), gw5.logs());
+  assert("旧 access 确实被用于请求", mock.logs().includes('"authorization":"Bearer workos:still-valid-access"'));
+  stop(gw5.p);
+}
+
+// ---------------------------------------------------------------- 4c. invalid_grant：明确提示重新登录
+console.log("\n[4c] refresh token 被拒绝（invalid_grant）：返回 401 提示重新登录");
+{
+  const tokenFile = join(TMP, "tokens4.json");
+  const fs = await import("node:fs");
+  fs.writeFileSync(tokenFile, JSON.stringify([
+    { access: "workos:revoked-access", refresh: "invalid-grant-refresh", expires: Date.now() - 1000, email: "r@example.com" },
+  ]));
+  const gw6 = await start(GATEWAY, {
+    PORT: String(9107),
+    CLINE_API_BASE: `http://127.0.0.1:${MOCK_PORT}/api/v1`,
+    CLINE_GATEWAY_TOKENS: tokenFile,
+  });
+  await waitReady("http://127.0.0.1:9107/health");
+  const r = await fetch("http://127.0.0.1:9107/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "m", messages: [{ role: "user", content: "hi" }] }),
+  });
+  const text = await r.text();
+  assert("HTTP 401", r.status === 401, text.slice(0, 120));
+  assert("错误信息提示重新登录", text.includes("re-login"), text.slice(0, 150));
+  stop(gw6.p);
 }
 
 // ---------------------------------------------------------------- 5. 模型列表
