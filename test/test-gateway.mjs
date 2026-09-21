@@ -281,6 +281,30 @@ console.log("\n[7] 下游认证：CLINE_GATEWAY_API_KEYS 配置后校验 Bearer"
   stop(gw3.p);
 }
 
+// ---------------------------------------------------------------- 8. 上游半途断连：SSE 优雅收尾（不报"网络中断"）
+console.log("\n[8] 上游断流：mock 发 1 个 chunk 后断连，网关补发 SSE error + [DONE] 收尾");
+{
+  const gw8 = await start(GATEWAY, {
+    PORT: String(9108),
+    CLINE_API_BASE: `http://127.0.0.1:${MOCK_PORT}/api/v1`,
+    CLINE_TOKEN: "drop-stream",
+  });
+  await waitReady("http://127.0.0.1:9108/health");
+  const r = await fetch("http://127.0.0.1:9108/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: "m", stream: true, messages: [{ role: "user", content: "drop" }] }),
+  });
+  const text = await r.text();
+  assert("HTTP 200（流式头已发出）", r.status === 200, text.slice(0, 80));
+  assert("中断后仍以 [DONE] 收尾", text.includes("data: [DONE]"), text.slice(0, 300));
+  assert("包含 SSE error 事件", text.includes('"stream_error"') || text.includes("stream interrupted"), text.slice(0, 300));
+  const alive = await fetch("http://127.0.0.1:9108/health");
+  assert("网关未崩溃（health 仍 200）", alive.status === 200);
+  assert("网关日志记录了中断原因", gw8.logs().includes("流式中断"), gw8.logs().slice(0, 300));
+  stop(gw8.p);
+}
+
 // ---------------------------------------------------------------- 清理
 stop(mock.p);
 stop(gw.p);

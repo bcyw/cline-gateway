@@ -68,6 +68,18 @@ const server = createServer(async (req, res) => {
     return json(429, { error: "Free limit reached on model deepseek/deepseek-v4-flash, try again in 1h" });
   }
 
+  // 模拟上游半途断连：发 1 个 chunk 后销毁连接（验证网关照常优雅收尾，
+  // 对下游补发 SSE error + [DONE]，而不是"网络中断"）
+  // 注意：必须等头+数据真正 flush 到 socket 后再 destroy，否则客户端拿不到响应头
+  if (auth.includes("workos:drop-stream")) {
+    res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+    res.write(`data: ${JSON.stringify({ success: true, data: { id: "chatcmpl-drop", object: "chat.completion.chunk", created: Math.floor(Date.now() / 1000), model: body.model, choices: [{ index: 0, delta: { content: "partial" }, finish_reason: null }] } })}\n\n`, () => {
+      // 数据确认送入 socket 后再断连，模拟真实"发一半网络中断"
+      setTimeout(() => res.destroy(), 50);
+    });
+    return;
+  }
+
   console.log("[mock] 200 for", auth.slice(0, 24), "| stream =", body.stream, "| model =", body.model, "| stream_options =", JSON.stringify(body.stream_options ?? null));
   // 记录完整请求头（小写键），供测试断言"网关头重写"效果
   console.log("[mock] headers:", JSON.stringify(req.headers));

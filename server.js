@@ -41,6 +41,7 @@
  *   Model:    deepseek/deepseek-v4-flash
  */
 import { createServer } from "node:http";
+import { once } from "node:events";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, chmodSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, dirname } from "node:path";
@@ -59,6 +60,13 @@ const USE_FINGERPRINT = process.env.CLINE_FINGERPRINT !== "false";
 const RATE_COOLDOWN_MS = Number(process.env.CLINE_RATE_COOLDOWN_MS ?? 60_000);
 // 复刻 Cline 的 DEFAULT_REFRESH_BUFFER_MS：过期前 5 分钟即视为需刷新
 const REFRESH_BUFFER_MS = Number(process.env.CLINE_REFRESH_BUFFER_MS ?? 5 * 60 * 1000);
+// 上游整体超时（含流式 body 读取）：默认 20 分钟，防长响应（思维链等）被 5 分钟硬超时误杀
+const UPSTREAM_TIMEOUT_MS = Number(process.env.CLINE_UPSTREAM_TIMEOUT_MS ?? 20 * 60 * 1000);
+// 流式无数据看门狗：上游超过该时长未吐任何数据视为死连接（网络中断但 TCP 未关），主动中止
+const UPSTREAM_INACTIVITY_MS = Number(process.env.CLINE_UPSTREAM_INACTIVITY_MS ?? 5 * 60 * 1000);
+// 下游 SSE 心跳间隔：上游长时间不吐数据（推理阶段）时向下游发 ": ping" 注释保活，
+// 防止中间链路（代理/路由器空闲超时）把连接掐断，表现为客户端"网络中断"
+const SSE_HEARTBEAT_MS = Number(process.env.CLINE_SSE_HEARTBEAT_MS ?? 15_000);
 // 可选下游认证：配置后校验 Bearer key；未配置 = 无认证（本地信任）
 const GATEWAY_API_KEYS = (process.env.CLINE_GATEWAY_API_KEYS ?? "")
   .split(",").map((s) => s.trim()).filter(Boolean);
@@ -277,12 +285,13 @@ async function unwrapJson(text) {
 }
 
 // ---------------------------------------------------------------- 上游调用
-async function callUpstream(token, body) {
+async function callUpstream(token, body, signal) {
   return fetch(`${CLINE_API_BASE}/chat/completions`, {
     method: "POST",
     headers: buildUpstreamHeaders(token),
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(5 * 60 * 1000),
+    // 超时/中止由 forwardChat 的统一 AbortController 管理（含客户端断开联动）
+    signal,
   });
 }
 
@@ -389,6 +398,18 @@ async function tryRefresh(cred) {
 
 // ---------------------------------------------------------------- 转发
 async function forwardChat(req, res) {
+  // 统一中止源：整体超时 + 客户端提前断开，两者任一触发即中止上游请求
+  // （避免悬空请求继续消耗 Cline 配额、占住 socket）
+  const controller = new AbortController();
+  const hardTimeout = setTimeout(
+    () => controller.abort(new Error(`upstream timeout after ${UPSTREAM_TIMEOUT_MS / 1000}s`)),
+    UPSTREAM_TIMEOUT_MS,
+  );
+  res.on("close", () => {
+    // 正常收尾（res.end 已调用）时 writableEnded == true，不中止；客户端提前断开才中止
+    if (!res.writableEnded) controller.abort(new Error("client disconnected"));
+  });
+  try {
   const bodyText = await readBody(req);
   let body;
   try { body = JSON.parse(bodyText); } catch {
@@ -441,7 +462,7 @@ async function forwardChat(req, res) {
       }
     }
 
-    const upstream = await callUpstream(cred.access, body).catch((e) => ({ status: 0, error: e }));
+    const upstream = await callUpstream(cred.access, body, controller.signal).catch((e) => ({ status: 0, error: e }));
     if (upstream.error) {
       return sendJson(res, 502, { error: { message: `upstream error: ${upstream.error.message}`, type: "server_error" } });
     }
@@ -457,7 +478,7 @@ async function forwardChat(req, res) {
       console.warn(`[cline-gateway] ${cred.email ?? "?"} -> HTTP 401, attempting refresh ...`);
       const rr = await tryRefresh(cred);
       if (rr === "ok") {
-        const retried = await callUpstream(cred.access, body).catch((e) => ({ status: 0, error: e }));
+        const retried = await callUpstream(cred.access, body, controller.signal).catch((e) => ({ status: 0, error: e }));
         if (retried.error) {
           return sendJson(res, 502, { error: { message: `upstream error: ${retried.error.message}`, type: "server_error" } });
         }
@@ -466,7 +487,7 @@ async function forwardChat(req, res) {
           last = retried;
           continue;
         }
-        return passThrough(res, retried, body);
+        return passThrough(res, retried, body, controller);
       }
       // invalid_grant 时明确提示重新登录；瞬时失败（transient）时原样透传 401
       if (rr === "invalid_grant") {
@@ -477,34 +498,102 @@ async function forwardChat(req, res) {
       continue;
     }
 
-    return passThrough(res, upstream, body);
+    return passThrough(res, upstream, body, controller);
   }
   // 所有账号都失败：原样转发最后一次上游响应
-  return passThrough(res, last ?? { status: 502, headers: new Headers({ "Content-Type": "application/json" }), body: null, text: async () => JSON.stringify({ error: { message: "all accounts failed", type: "server_error" } }) }, body);
+    return passThrough(res, last ?? { status: 502, headers: new Headers({ "Content-Type": "application/json" }), body: null, text: async () => JSON.stringify({ error: { message: "all accounts failed", type: "server_error" } }) }, body, controller);
+  } finally {
+    clearTimeout(hardTimeout);
+  }
 }
 
-async function passThrough(res, upstream, body) {
+async function passThrough(res, upstream, body, controller) {
   const contentType = upstream.headers?.get?.("content-type") ?? "application/json";
   const isStream = body?.stream === true && contentType.includes("text/event-stream");
   // 响应头过滤：hop-by-hop 与安全敏感头不透传（Content-Type 由网关管理）
   const headers = { "Content-Type": contentType, ...filterUpstreamHeaders(upstream.headers) };
   res.writeHead(upstream.status, headers);
   if (isStream) {
-    // ServerResponse 是 Node 流而非 web WritableStream，不能 pipeTo，手动转发
-    const reader = upstream.body.pipeThrough(unwrapStream()).getReader();
-    try {
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        res.write(value);
-      }
-    } finally {
-      res.end();
-    }
+    await pipeStreamToResponse(res, upstream, controller);
     return;
   }
-  const text = await upstream.text();
+  let text;
+  try {
+    text = await upstream.text();
+  } catch (e) {
+    // 非流式：上游在 body 读取阶段中断（超时/断连），头部已发出无法改状态码
+    console.warn(`[cline-gateway] 非流式读取上游响应失败: ${e?.message ?? e}`);
+    if (!res.destroyed) res.destroy();
+    return;
+  }
   res.end(await unwrapJson(text));
+}
+
+// 流式转发（SSE）：优雅收尾 + 背压 + 心跳保活 + 上游断流看门狗
+// 核心目标：上游任何形式的中断（断连/超时/socket reset）都不再以"网络中断"
+// 的形式砸给下游——头部已发出时补发 SSE error 事件并以 [DONE] 正常收尾。
+async function pipeStreamToResponse(res, upstream, controller) {
+  const reader = upstream.body.pipeThrough(unwrapStream()).getReader();
+  let lastData = Date.now();
+  let heartbeat = null;
+
+  // 心跳：上游长时间不吐数据（推理阶段）时向下游发 SSE 注释行保活，
+  // 防止中间链路（代理/路由器空闲超时）把连接掐断成"网络中断"
+  if (SSE_HEARTBEAT_MS > 0) {
+    heartbeat = setInterval(() => {
+      if (!res.destroyed && !res.writableEnded && Date.now() - lastData >= SSE_HEARTBEAT_MS) {
+        res.write(": ping\n\n");
+      }
+    }, SSE_HEARTBEAT_MS);
+  }
+
+  // 上游看门狗：超过 UPSTREAM_INACTIVITY_MS 没吐任何数据判定死连接，
+  // 主动 abort（TCP 可能已半开，read 永远等不到数据）
+  const watchdog = setInterval(() => {
+    if (Date.now() - lastData > UPSTREAM_INACTIVITY_MS) {
+      controller.abort(new Error(`upstream inactivity: no data for ${UPSTREAM_INACTIVITY_MS / 1000}s`));
+    }
+  }, Math.min(SSE_HEARTBEAT_MS || 10_000, 10_000));
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      lastData = Date.now();
+      if (value?.length) {
+        if (!res.write(value)) {
+          // 背压：写缓冲满时等 drain；客户端断开时 'close' 先触发，防止永久挂起
+          await Promise.race([once(res, "drain"), once(res, "close")]);
+        }
+      }
+    }
+    if (!res.destroyed) res.end();
+  } catch (err) {
+    // 主动中止（客户端断开/整体超时/看门狗）与上游意外断流统一在此收尾
+    const aborted = controller.signal.aborted || err?.name === "AbortError";
+    const reason = aborted
+      ? (controller.signal.reason?.message ?? "aborted")
+      : (err?.message ?? String(err));
+    console.warn(`[cline-gateway] 流式中断: ${reason}${aborted ? " (已中止)" : ""}`);
+    if (!res.destroyed && !res.writableEnded) {
+      try {
+        // 头部已发出，状态码无法更改；补发 SSE error 事件并以 [DONE] 收尾，
+        // 客户端显示"上游出错"而非"网络中断"
+        res.write(`data: ${JSON.stringify({ error: { message: `upstream stream interrupted: ${reason}`, type: "stream_error" } })}\n\n`);
+        res.write("data: [DONE]\n\n");
+        res.end();
+      } catch {
+        res.destroy();
+      }
+    } else {
+      res.destroy();
+    }
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
+    clearInterval(watchdog);
+    // 释放上游 body：undici 要求未读/中止的 body 必须 cancel，否则占住连接池导致 socket 泄漏
+    try { await upstream.body?.cancel?.(); } catch { /* 已关闭/已消费，忽略 */ }
+  }
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -515,6 +604,7 @@ async function readBody(req) {
 }
 
 function sendJson(res, status, obj) {
+  if (res.destroyed) return; // 客户端已断开时向死 socket 写会触发 error 事件
   res.writeHead(status, { "Content-Type": "application/json" });
   res.end(JSON.stringify(obj));
 }

@@ -47,6 +47,8 @@ Model:    deepseek/deepseek-v4-flash   （或 /v1/models 列出的任意模型�
 - 自动解包上游 `{success, data}` 信封（流式逐块解包）
 - hop-by-hop 头（`Connection`、`Transfer-Encoding`、`Upgrade` 等）与 `Set-Cookie` 不透传
 - 流式请求自动注入 `stream_options: { include_usage: true }`（对齐 Cline 客户端行为）
+- 流式网络韧性：客户端断开即中止上游（不白烧配额）；上游断流/超时对下游补发 SSE `error` 事件 + `[DONE]` 优雅收尾，不再表现为"网络中断"；上游长时间无 token 时向下游发 `: ping` 心跳保活
+- 背压处理：下游写缓冲满时等 `drain`，慢客户端不会导致内存无限堆积
 
 ## 配置（环境变量）
 
@@ -62,14 +64,17 @@ Model:    deepseek/deepseek-v4-flash   （或 /v1/models 列出的任意模型�
 | `CLINE_REFRESH_BUFFER_MS` | `300000` | 过期前刷新缓冲 |
 | `CLINE_GATEWAY_API_KEYS` | 无 | 可选下游认证：逗号分隔 key，配置后校验 `Bearer`；未配置 = 无认证（本地信任） |
 | `CLINE_CLIENT_VERSION` | `3.0.55` | 指纹头版本号 |
+| `CLINE_UPSTREAM_TIMEOUT_MS` | `1200000` (20 分钟) | 上游整体超时（含流式 body 读取），防长响应被误杀 |
+| `CLINE_UPSTREAM_INACTIVITY_MS` | `300000` (5 分钟) | 流式无数据看门狗：上游超过该时长未吐数据判定死连接并主动中止 |
+| `CLINE_SSE_HEARTBEAT_MS` | `15000` | 下游 SSE 心跳间隔（向上游空闲间隙发 `: ping` 保活），`0` 关闭 |
 
 ## 测试
 
 ```bash
-node test/test-gateway.mjs    # mock 上游 + 网关全链路，36 项断言
+node test/test-gateway.mjs    # mock 上游 + 网关全链路，48 项断言
 ```
 
-覆盖：非流式/流式/信封解包、429 轮询与冷却、401 预刷新与回写、模型列表、请求头重写（下游头丢弃 + 白名单重建）、可选下游认证。
+覆盖：非流式/流式/信封解包、429 轮询与冷却、401 预刷新与回写、模型列表、请求头重写（下游头丢弃 + 白名单重建）、可选下游认证、上游半途断连的 SSE 优雅收尾。
 
 ## 安全说明
 
